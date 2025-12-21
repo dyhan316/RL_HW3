@@ -24,8 +24,105 @@ class Car:
         return (f"Car(id={self.id}, size={self.size}, "
                 f"year={self.year}, damage={self.damage}, pat={self.patience})")
 
+
+
+
 class GarageEnv(gym.Env):
-    def __init__(self, debug=True, seed=None):
+    def __init__(self, debug=True, seed=None, reward_weights=None):  #*added for hw
+        """Initialize the car repair shop simulation environment. #*added by danny
+
+        Args:
+            debug (bool, optional): Flag to enable debug mode. Defaults to True.
+            seed (int, optional): Random seed for reproducibility. Defaults to None.
+
+        Attributes:
+            max_waiting (int): Maximum number of cars allowed in the waiting area (capacity = 3).
+            total_cars_created (int): Total number of cars created during simulation.
+            car_id_counter (int): Counter for assigning unique IDs to cars.
+            success_count (int): Number of successfully repaired cars.
+            removed_count (int): Number of cars removed due to patience exhaustion.
+            waiting_area (list): Queue of Car objects waiting for repair.
+            car_patience (dict): Maps car IDs to their remaining patience ticks.
+            repair_status (dict): Status of each repair station ('A', 'B', 'C'), stores (car, remaining_ticks, assigned_ticks).
+            current_time (int): Current simulation time in ticks.
+            arrival_timer (int): Ticks until the next batch of cars arrives.
+            action_space (spaces.Discrete): Action space with max_waiting * 3 + 1 discrete actions.
+            observation_space (spaces.Box): Continuous observation space normalized to [0, 1].
+
+        Example Flow:
+            Tick 0:
+            - waiting_area: [Car(id=0, size=4.5, year=15, damage=0.3, pat=100)]
+            - car_patience: {0: 100}
+            - repair_status: {'A': None, 'B': None, 'C': None}
+            - success_count: 0, removed_count: 0
+            
+            After action=1 (assign Car 0 to station A):
+            - waiting_area: []
+            - car_patience: {} (car removed from patience dict)
+            - repair_status: {'A': (Car(id=0,...), 35, 35), 'B': None, 'C': None}
+            - success_count: 0
+            
+            After 35 ticks of repair:
+            - repair_status: {'A': None, 'B': None, 'C': None}
+            - success_count: 1 (car successfully serviced)
+
+        Note:
+            - obs_dim = 15: Observation dimension = 4 * max_waiting + 3
+            - Observation space normalized to [0, 1] as Box(float32)
+            - Patience decreases each tick; when patience <= 0, car is removed with -50 reward penalty
+        
+        
+        Gymnasium spaces (how they are used in this env)
+        -----------------------------------------------
+        Gymnasium environments expose two key attributes that formally describe the
+        input/output interface for an RL agent:
+
+        1) action_space
+            - A `gymnasium.spaces.Space` object that defines what actions are valid.
+            - Here we use `spaces.Discrete(n)`, meaning the agent chooses an integer
+                action in {0, 1, ..., n-1}.
+            - In this environment:
+                * action = 0 means "no-op" (do nothing this tick).
+                * actions 1..(max_waiting*3) encode "assign a waiting car to a station".
+                The encoding is:
+                - idx = (action - 1) // 3     -> which car index in the waiting queue
+                - station_idx = (action - 1) % 3 -> which station (A/B/C)
+                This compact encoding is a common Gym-style pattern for turning a
+                multi-choice decision (pick car, pick station) into a single Discrete id.
+
+        2) observation_space
+            - A `gymnasium.spaces.Space` object that defines the shape/range/type of
+                observations returned by `reset()` and `step()`.
+            - Here we use `spaces.Box(low=..., high=..., dtype=np.float32)`, which
+                represents a continuous vector observation with per-dimension bounds.
+            - In this environment the observation is intended to be a fixed-length
+                vector that summarizes the current state (waiting cars + station status),
+                normalized to [0, 1]. That normalization is why `low` is all zeros and
+                `high` is all ones.
+
+        How Gymnasium uses these:
+        - `reset()` must return an observation that is contained in `observation_space`.
+        - `step(action)` is expected to receive an action contained in `action_space`,
+            and returns (observation, reward, terminated, truncated, info).
+        - Many RL libraries rely on `action_space` and `observation_space` to build
+            neural network input/output layers and to validate shapes/types.
+        
+        Is Gymnasium only used for action/observation spaces?
+        > Not necessarily. In addition to `spaces.Discrete` and `spaces.Box`, Gymnasium
+        is typically also used via:
+        - Inheriting from `gymnasium.Env` (via `super().__init__()`), which defines
+            the standard RL API contract (`reset()`, `step()`, optional `render()`,
+            `close()`) and enables compatibility with Gymnasium-based libraries.
+        - Seeding utilities and RNG handling (e.g., `Env.seed(...)` / `np_random`)
+            when the environment supports reproducible randomness.
+        - Optional wrappers, monitoring, vectorization, and validation that rely on
+            `action_space` and `observation_space` metadata.
+        To determine exactly which other Gymnasium features are used in *this codebase*,
+        check the rest of the environment for imports/usages such as:
+        `gymnasium.Env`, `gymnasium.utils.seeding`, `reset()`, `step()`,
+        `render()`, `metadata`, and wrapper-related integration.        
+    
+        """
         
         super().__init__()
         self.debug = debug
@@ -36,6 +133,17 @@ class GarageEnv(gym.Env):
         self.car_id_counter = 0
         self.success_count = 0
         self.removed_count = 0
+
+        #*added for hw: configurable reward shaping
+        default_rw = {
+            "assign": 0.5,
+            "complete": 100.0,
+            "expire": -50.0,
+            "invalid": -1.0,
+            "wait_penalty": -0.1,
+            "time_penalty": -1.0,  #*added for hw
+        }
+        self.reward_weights = {**default_rw, **(reward_weights or {})}
 
         # Waiting area and garage status
         self.waiting_area = []                          # List[Car]
@@ -55,6 +163,7 @@ class GarageEnv(gym.Env):
         low = np.zeros(obs_dim, dtype=np.float32)
         high = np.ones(obs_dim, dtype=np.float32)
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
+        
         ###################################################################################
 
         if seed is not None:
@@ -99,7 +208,7 @@ class GarageEnv(gym.Env):
                 car = self.waiting_area[idx]
                 # Penalty if station is already occupied
                 if self.repair_status[station] is not None:
-
+                    reward += self.reward_weights["invalid"]  #*added for hw
                     if self.debug:
                         print(
                             f"[tick {self.current_time}] \033[91m!! Invalid assign: station {station} occupied\033[0m")
@@ -108,6 +217,7 @@ class GarageEnv(gym.Env):
                     self.repair_status[station] = (car, repair_time, repair_time)
                     self.waiting_area.pop(idx)
                     del self.car_patience[car.id]
+                    reward += self.reward_weights["assign"]  #*added for hw
                     if self.debug:
                         print(
                             f"[tick {self.current_time}] \033[96m-> Assigned {car} to {station} (t={repair_time} ticks) \033[0m")
@@ -124,7 +234,7 @@ class GarageEnv(gym.Env):
             self.car_patience[cid] -= 1
             if self.car_patience[cid] <= 0:
                 self._remove_car(cid)
-                reward -= 50    # Default reward, adjustable
+                reward += self.reward_weights["expire"]  #*added for hw
                 if self.debug:
                     print(f"[tick {self.current_time}] \033[35m-- Car {cid} patience expired, removed\033[0m")
 
@@ -134,9 +244,14 @@ class GarageEnv(gym.Env):
                 car, rem, assigned = status
                 rem -= 1
                 if rem <= 0:
+                    reward += self.reward_weights["complete"]  #*added for hw
                     self._finish_repair(st)
                 else:
                     self.repair_status[st] = (car, rem, assigned)
+
+        #*added for hw: per-tick queue penalty
+        reward += self.reward_weights["wait_penalty"] * len(self.waiting_area)
+        reward += self.reward_weights["time_penalty"]  #*added for hw: global per-step cost
 
         # 5) Update time and return
         self.current_time += 1
@@ -156,7 +271,25 @@ class GarageEnv(gym.Env):
         vec = np.zeros(4 * self.max_waiting + 3, dtype=np.float32)
         # TODO: Define observation vector
         ############################ Modify this section if needed ################################
+        #*added for hw: encode up to max_waiting cars
+        for i in range(min(len(self.waiting_area), self.max_waiting)):
+            car = self.waiting_area[i]
+            base = i * 4
+            size_norm = (car.size - 3.0) / 2.0
+            year_norm = (car.year - 10.0) / 15.0
+            damage_norm = car.damage
+            patience_norm = float(self.car_patience.get(car.id, car.patience)) / 100.0
 
+            vec[base + 0] = np.clip(size_norm, 0.0, 1.0)
+            vec[base + 1] = np.clip(year_norm, 0.0, 1.0)
+            vec[base + 2] = np.clip(damage_norm, 0.0, 1.0)
+            vec[base + 3] = np.clip(patience_norm, 0.0, 1.0)
+
+        #*added for hw: station occupancy flags (A,B,C)
+        offset = 4 * self.max_waiting
+        vec[offset + 0] = 1.0 if self.repair_status['A'] is not None else 0.0
+        vec[offset + 1] = 1.0 if self.repair_status['B'] is not None else 0.0
+        vec[offset + 2] = 1.0 if self.repair_status['C'] is not None else 0.0
         ###################################################################################
         return np.concatenate([vec]).astype(np.float32)
 
